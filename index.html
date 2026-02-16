@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>Risk Curves – Final</title>
+
+<link rel="stylesheet" href="https://js.arcgis.com/4.29/esri/themes/light/main.css"/>
+<script src="https://js.arcgis.com/4.29/"></script>
+
+<style>
+html,body{margin:0;height:100%;font-family:Arial, Helvetica, sans-serif;background:#fcf8f8}
+#app{display:flex;height:100%}
+#sidebar{width:260px;background:#fff;border-right:1px solid #e6e6e6;display:flex;flex-direction:column;box-shadow:2px 0 10px rgba(0,0,0,0.05)}
+#selectorHeader{background:#004e70;color:#fff;padding:14px}
+#selectorTitle{font-weight:800;font-size:14px}
+#selectorSub{font-size:12px;opacity:.9;margin-top:2px}
+#selectorBody{padding:14px;display:flex;flex-direction:column;gap:10px}
+#tramoSelect{padding:10px;border-radius:10px;border:1px solid #d4d4d4}
+#resetBtn{border:none;padding:10px;border-radius:10px;background:#eef3f6;font-weight:700;cursor:pointer}
+#content{flex:1;display:flex;flex-direction:column}
+#viewDiv{height:60%}
+#charts{height:40%;display:flex;gap:12px;padding:14px}
+.panel{flex:1;background:#fff;border:1px solid #e6e6e6;border-radius:12px;padding:12px;position:relative;box-shadow:0 2px 10px rgba(0,0,0,0.06)}
+.title{font-weight:700;margin-bottom:6px}
+canvas{width:100%;height:calc(100% - 20px)}
+.legend{position:absolute;right:12px;top:12px;font-size:12px}
+.legend div{display:flex;align-items:center;margin-bottom:4px}
+.swatch{width:12px;height:12px;margin-right:6px}
+</style>
+</head>
+
+<body>
+
+<div id="app">
+  <div id="sidebar">
+    <div id="selectorHeader">
+      <div id="selectorTitle">Filter by Segment</div>
+      <div id="selectorSub">Loading segments…</div>
+    </div>
+    <div id="selectorBody">
+      <select id="tramoSelect"><option value="">Loading…</option></select>
+      <button id="resetBtn">Reset</button>
+    </div>
+  </div>
+
+  <div id="content">
+    <div id="viewDiv"></div>
+    <div id="charts">
+      <div class="panel">
+        <div class="title" id="lossTitle">Loss Curves</div>
+        <canvas id="lossCanvas"></canvas>
+        <div class="legend" id="lossLegend"></div>
+      </div>
+      <div class="panel">
+        <div class="title" id="damageTitle">Damage Curves</div>
+        <canvas id="damageCanvas"></canvas>
+        <div class="legend" id="damageLegend"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+require([
+  "esri/Map","esri/views/MapView","esri/layers/FeatureLayer"
+], function(Map, MapView, FeatureLayer){
+
+const layer=new FeatureLayer({
+  url:"https://services6.arcgis.com/sROlVM0rATIYgC6a/ArcGIS/rest/services/roads_results_20251119_160249/FeatureServer/0",
+  outFields:["*"],
+  renderer:{
+      type:"unique-value",
+      field:"ID_TRAMO",
+      defaultSymbol:{type:"simple-line",width:2,color:"#999"},
+      visualVariables:[{
+        type:"color",
+        field:"ID_TRAMO",
+        stops:[
+          {value:0,color:"#1f77b4"},
+          {value:100,color:"#ff7f0e"},
+          {value:200,color:"#2ca02c"},
+          {value:300,color:"#d62728"},
+          {value:400,color:"#9467bd"},
+          {value:500,color:"#17becf"}
+        ]
+      }]
+    },
+	// Labels con halo
+    labelingInfo:[{
+      labelExpressionInfo:{expression:"$feature.ID_TRAMO"},
+      labelPlacement:"center-along",
+      symbol:{
+        type:"text",
+        color:"#111",
+        haloColor:"#ffffff",
+        haloSize:"2px",
+        font:{size:10,family:"Arial",weight:"bold"}
+      }
+    }]
+});
+
+const map=new Map({basemap:"gray-vector",layers:[layer]});
+const view=new MapView({container:"viewDiv",map,center:[-70.4,19],zoom:7});
+view.popup.autoOpenEnabled=false;
+
+const lossCanvas=document.getElementById("lossCanvas");
+const damageCanvas=document.getElementById("damageCanvas");
+const select=document.getElementById("tramoSelect");
+const resetBtn=document.getElementById("resetBtn");
+const selectorSub=document.getElementById("selectorSub");
+
+const hazardColors={river:"#1f77b4",coast:"#ff7f0e",tsunami:"#2ca02c",earthquake:"#17becf"};
+
+let initialExtent=null,layerViewRef=null,highlightHandle=null;
+
+function formatNumber(num){
+  if(num>=1e9) return (num/1e9).toFixed(1)+"B";
+  if(num>=1e6) return (num/1e6).toFixed(1)+"M";
+  if(num>=1e3) return (num/1e3).toFixed(0)+"K";
+  return Number(num).toFixed(0);
+}
+
+function extractSeries(attrs,type){
+  const regex=new RegExp(`^${type}_(river|coast|tsunami|earthquake)_(\\d+)`,'i');
+  const groups={};
+  Object.keys(attrs).forEach(f=>{
+    const m=f.match(regex);
+    if(!m) return;
+    const hazard=m[1].toLowerCase();
+    const period=Number(m[2]);
+    const val=Number(attrs[f]);
+    if(!groups[hazard]) groups[hazard]=[];
+    groups[hazard].push({x:val,y:Math.log10(1/period),period});
+  });
+  return Object.keys(groups).map(h=>{
+    const s=groups[h].sort((a,b)=>a.period-b.period);
+    return {hazard:h,color:hazardColors[h],x:s.map(d=>d.x),y:s.map(d=>d.y)};
+  });
+}
+
+async function buildTotalSeries(type){
+  const res=await layer.queryFeatures({where:"1=1",outFields:["*"],returnGeometry:false});
+  const totals={};
+  res.features.forEach(f=>{
+    Object.keys(f.attributes).forEach(field=>{
+      const regex=new RegExp(`^${type}_(river|coast|tsunami|earthquake)_(\\d+)`,'i');
+      if(!field.match(regex)) return;
+      totals[field]=(totals[field]||0)+Number(f.attributes[field]||0);
+    });
+  });
+  return extractSeries(totals,type);
+}
+
+function fitCanvas(canvas){
+  const r=canvas.getBoundingClientRect();
+  const dpr=window.devicePixelRatio||1;
+  canvas.width=r.width*dpr;
+  canvas.height=r.height*dpr;
+  const ctx=canvas.getContext("2d");
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  return {ctx,w:r.width,h:r.height};
+}
+
+function drawLegend(id,series){
+  const c=document.getElementById(id); c.innerHTML="";
+  series.forEach(s=>{
+    const row=document.createElement("div");
+    const sw=document.createElement("div");
+    sw.className="swatch"; sw.style.background=s.color;
+    row.appendChild(sw); row.appendChild(document.createTextNode(s.hazard));
+    c.appendChild(row);
+  });
+}
+
+function drawSmoothLine(ctx,pts){
+  if(pts.length<2) return;
+  ctx.beginPath(); ctx.moveTo(pts[0].x,pts[0].y);
+  for(let i=1;i<pts.length-1;i++){
+    const xc=(pts[i].x+pts[i+1].x)/2;
+    const yc=(pts[i].y+pts[i+1].y)/2;
+    ctx.quadraticCurveTo(pts[i].x,pts[i].y,xc,yc);
+  }
+  ctx.quadraticCurveTo(pts[pts.length-1].x,pts[pts.length-1].y,pts[pts.length-1].x,pts[pts.length-1].y);
+  ctx.stroke();
+}
+
+function drawMulti(canvas,titleId,titleText,series,xLabel){
+  document.getElementById(titleId).textContent=titleText;
+  const {ctx,w,h}=fitCanvas(canvas);
+  ctx.clearRect(0,0,w,h);
+  if(!series.length) return;
+
+  const padL=80,padR=20,padT=20,padB=80;
+
+  ctx.fillStyle="#f2f2f2";
+  ctx.fillRect(padL,padT,w-padL-padR,h-padT-padB);
+
+  const allX=series.flatMap(s=>s.x);
+  const xmin=Math.min(...allX);
+  const xmax=Math.max(...allX);
+
+  const ymin=Math.log10(0.0001);
+  const ymax=Math.log10(1);
+
+  const xScale=x=>padL+(x-xmin)*(w-padL-padR)/(xmax-xmin||1);
+  const yScale=y=>h-padB-(y-ymin)*(h-padB-padT)/(ymax-ymin);
+
+  // AXES
+  ctx.strokeStyle="#333";
+  ctx.lineWidth=1;
+  ctx.beginPath();
+  ctx.moveTo(padL,padT);
+  ctx.lineTo(padL,h-padB);
+  ctx.lineTo(w-padR,h-padB);
+  ctx.stroke();
+
+  // ===== Y TICKS =====
+  const yTicks = [1, 0.1, 0.01, 0.001, 0.0001];
+  ctx.font = "11px Arial";
+  ctx.textAlign = "right";
+  ctx.fillStyle = "#000";
+
+  
+yTicks.forEach(val => {
+  const y = yScale(Math.log10(val));
+
+  // grid
+  ctx.strokeStyle = "rgba(0,0,0,0.08)";
+  ctx.beginPath();
+  ctx.moveTo(padL, y);
+  ctx.lineTo(w - padR, y);
+  ctx.stroke();
+
+  // tick
+  ctx.strokeStyle = "#333";
+  ctx.beginPath();
+  ctx.moveTo(padL - 5, y);
+  ctx.lineTo(padL, y);
+  ctx.stroke();
+
+  // label formato 10^-x
+  const exponent = Math.log10(val);
+  ctx.fillText(`10^${exponent}`, padL - 8, y + 3);
+});
+
+  // ===== X TICKS =====
+  const tickCount=6;
+  ctx.textAlign="center";
+  ctx.fillStyle="#000";
+
+  for(let i=0;i<=tickCount;i++){
+    const val=xmin+(i*(xmax-xmin)/tickCount);
+    const x=xScale(val);
+
+    ctx.strokeStyle="#333";
+    ctx.beginPath();
+    ctx.moveTo(x,h-padB);
+    ctx.lineTo(x,h-padB+5);
+    ctx.stroke();
+
+    ctx.fillText(formatNumber(val),x,h-padB+18);
+  }
+
+  // ===== SERIES =====
+  series.forEach(s=>{
+    ctx.strokeStyle=s.color;
+    ctx.lineWidth=2.8;
+    const pts=s.x.map((x,i)=>({x:xScale(x),y:yScale(s.y[i])}));
+    drawSmoothLine(ctx,pts);
+    ctx.fillStyle=s.color;
+    pts.forEach(p=>{
+      ctx.beginPath();
+      ctx.arc(p.x,p.y,3,0,Math.PI*2);
+      ctx.fill();
+    });
+  });
+
+  // ===== AXIS LABELS =====
+  ctx.fillStyle="#000";
+  ctx.font="12px Arial";
+  ctx.textAlign="center";
+  ctx.fillText(xLabel,(padL+w-padR)/2,h-6);
+
+  ctx.save();
+  ctx.translate(18,(h-padB+padT)/2);
+  ctx.rotate(-Math.PI/2);
+  ctx.fillText("Annual rate of exceedance (1/m)",0,0);
+  ctx.restore();
+}
+
+
+async function showTotalSystemCurves(){
+  const lossSeries=await buildTotalSeries("loss");
+  const damageSeries=await buildTotalSeries("damage");
+  drawMulti(lossCanvas,"lossTitle","Loss Curves — TOTAL SYSTEM (DOP)",lossSeries,"Loss (DOP)");
+  drawMulti(damageCanvas,"damageTitle","Damage Curves — TOTAL SYSTEM (DOP)",damageSeries,"Damage (DOP)");
+  drawLegend("lossLegend",lossSeries);
+  drawLegend("damageLegend",damageSeries);
+  selectorSub.textContent="Showing TOTAL system curves";
+}
+
+function setHighlight(feature){
+  if(highlightHandle){highlightHandle.remove();}
+  highlightHandle=layerViewRef.highlight(feature);
+}
+
+function updateFromFeature(feature,total){
+  const attrs=feature.attributes;
+  const id=attrs.ID_TRAMO;
+  const lossSeries=extractSeries(attrs,"loss");
+  const damageSeries=extractSeries(attrs,"damage");
+  drawMulti(lossCanvas,"lossTitle",`Loss Curves — ${id}`,lossSeries,"Loss (DOP)");
+  drawMulti(damageCanvas,"damageTitle",`Damage Curves — ${id}`,damageSeries,"Damage (DOP)");
+  drawLegend("lossLegend",lossSeries);
+  drawLegend("damageLegend",damageSeries);
+  selectorSub.textContent=`Selected: ${id} • Total: ${total}`;
+}
+
+view.when(async()=>{
+  initialExtent=view.extent.clone();
+  layerViewRef=await view.whenLayerView(layer);
+
+  const res=await layer.queryFeatures({where:"1=1",outFields:["ID_TRAMO"],returnDistinctValues:true});
+  const ids=res.features.map(f=>f.attributes.ID_TRAMO).sort((a,b)=>a-b);
+  ids.forEach(id=>{
+    const opt=document.createElement("option");
+    opt.value=id; opt.text=id;
+    select.appendChild(opt);
+  });
+
+  select.dataset.totalCount=ids.length;
+  await showTotalSystemCurves();
+});
+
+view.on("click",async e=>{
+  const hit=await view.hitTest(e);
+  const r=hit.results.find(x=>x.graphic.layer===layer);
+  if(!r) return;
+  setHighlight(r.graphic);
+  updateFromFeature(r.graphic,select.dataset.totalCount);
+});
+
+select.addEventListener("change",async ()=>{
+  const id=select.value;
+  if(!id) return;
+  const res=await layer.queryFeatures({where:`ID_TRAMO=${id}`,outFields:["*"],returnGeometry:true});
+  const f=res.features[0];
+  await view.goTo(f.geometry);
+  setHighlight(f);
+  updateFromFeature(f,select.dataset.totalCount);
+});
+
+resetBtn.addEventListener("click",async ()=>{
+  if(highlightHandle){highlightHandle.remove();}
+  await view.goTo(initialExtent);
+  select.value="";
+  await showTotalSystemCurves();
+});
+
+});
+</script>
+</body>
+</html>

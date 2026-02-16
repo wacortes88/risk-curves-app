@@ -15,7 +15,7 @@ html,body{margin:0;height:100%;font-family:Arial, Helvetica, sans-serif;backgrou
 #selectorTitle{font-weight:800;font-size:14px}
 #selectorSub{font-size:12px;opacity:.9;margin-top:2px}
 #selectorBody{padding:14px;display:flex;flex-direction:column;gap:10px}
-#tramoSelect{padding:10px;border-radius:10px;border:1px solid #d4d4d4}
+select{padding:10px;border-radius:10px;border:1px solid #d4d4d4}
 #resetBtn{border:none;padding:10px;border-radius:10px;background:#eef3f6;font-weight:700;cursor:pointer}
 #content{flex:1;display:flex;flex-direction:column}
 #viewDiv{height:60%}
@@ -30,15 +30,19 @@ canvas{width:100%;height:calc(100% - 20px)}
 </head>
 
 <body>
-
 <div id="app">
   <div id="sidebar">
     <div id="selectorHeader">
-      <div id="selectorTitle">Filter by Segment</div>
+      <div id="selectorTitle">Filters</div>
       <div id="selectorSub">Loading segments…</div>
     </div>
     <div id="selectorBody">
-      <select id="tramoSelect"><option value="">Loading…</option></select>
+      <select id="tramoSelect">
+        <option value="">Filter by ID_TRAMO</option>
+      </select>
+      <select id="tramoAttSelect">
+        <option value="">Filter by TRAMO_ATT</option>
+      </select>
       <button id="resetBtn">Reset</button>
     </div>
   </div>
@@ -69,34 +73,33 @@ const layer=new FeatureLayer({
   url:"https://services6.arcgis.com/sROlVM0rATIYgC6a/ArcGIS/rest/services/roads_results_20251119_160249/FeatureServer/0",
   outFields:["*"],
   renderer:{
-      type:"unique-value",
+    type:"unique-value",
+    field:"ID_TRAMO",
+    defaultSymbol:{type:"simple-line",width:2,color:"#999"},
+    visualVariables:[{
+      type:"color",
       field:"ID_TRAMO",
-      defaultSymbol:{type:"simple-line",width:2,color:"#999"},
-      visualVariables:[{
-        type:"color",
-        field:"ID_TRAMO",
-        stops:[
-          {value:0,color:"#1f77b4"},
-          {value:100,color:"#ff7f0e"},
-          {value:200,color:"#2ca02c"},
-          {value:300,color:"#d62728"},
-          {value:400,color:"#9467bd"},
-          {value:500,color:"#17becf"}
-        ]
-      }]
-    },
-	// Labels con halo
-    labelingInfo:[{
-      labelExpressionInfo:{expression:"$feature.ID_TRAMO"},
-      labelPlacement:"center-along",
-      symbol:{
-        type:"text",
-        color:"#111",
-        haloColor:"#ffffff",
-        haloSize:"2px",
-        font:{size:10,family:"Arial",weight:"bold"}
-      }
+      stops:[
+        {value:0,color:"#1f77b4"},
+        {value:100,color:"#ff7f0e"},
+        {value:200,color:"#2ca02c"},
+        {value:300,color:"#d62728"},
+        {value:400,color:"#9467bd"},
+        {value:500,color:"#17becf"}
+      ]
     }]
+  },
+  labelingInfo:[{
+    labelExpressionInfo:{expression:"$feature.ID_TRAMO"},
+    labelPlacement:"center-along",
+    symbol:{
+      type:"text",
+      color:"#111",
+      haloColor:"#ffffff",
+      haloSize:"2px",
+      font:{size:10,family:"Arial",weight:"bold"}
+    }
+  }]
 });
 
 const map=new Map({basemap:"gray-vector",layers:[layer]});
@@ -105,7 +108,8 @@ view.popup.autoOpenEnabled=false;
 
 const lossCanvas=document.getElementById("lossCanvas");
 const damageCanvas=document.getElementById("damageCanvas");
-const select=document.getElementById("tramoSelect");
+const tramoSelect=document.getElementById("tramoSelect");
+const tramoAttSelect=document.getElementById("tramoAttSelect");
 const resetBtn=document.getElementById("resetBtn");
 const selectorSub=document.getElementById("selectorSub");
 
@@ -113,13 +117,21 @@ const hazardColors={river:"#1f77b4",coast:"#ff7f0e",tsunami:"#2ca02c",earthquake
 
 let initialExtent=null,layerViewRef=null,highlightHandle=null;
 
-function formatNumber(num){
-  if(num>=1e9) return (num/1e9).toFixed(1)+"B";
-  if(num>=1e6) return (num/1e6).toFixed(1)+"M";
-  if(num>=1e3) return (num/1e3).toFixed(0)+"K";
-  return Number(num).toFixed(0);
+/* ===== Helpers ===== */
+function escapeSqlString(s){
+  return String(s).replace(/'/g,"''");
 }
 
+function formatNumber(num){
+  const n=Number(num);
+  if(!isFinite(n)) return "";
+  if(n>=1e9) return (n/1e9).toFixed(1)+"B";
+  if(n>=1e6) return (n/1e6).toFixed(1)+"M";
+  if(n>=1e3) return (n/1e3).toFixed(0)+"K";
+  return n.toFixed(0);
+}
+
+/* Extract series from attributes: y=log10(1/period) */
 function extractSeries(attrs,type){
   const regex=new RegExp(`^${type}_(river|coast|tsunami|earthquake)_(\\d+)`,'i');
   const groups={};
@@ -138,6 +150,7 @@ function extractSeries(attrs,type){
   });
 }
 
+/* Sum all curves for TOTAL system */
 async function buildTotalSeries(type){
   const res=await layer.queryFeatures({where:"1=1",outFields:["*"],returnGeometry:false});
   const totals={};
@@ -151,6 +164,26 @@ async function buildTotalSeries(type){
   return extractSeries(totals,type);
 }
 
+/* Sum curves for a TRAMO_ATT group */
+async function buildSeriesByTramoAtt(tramoAttValue,type){
+  const v=escapeSqlString(tramoAttValue);
+  const res=await layer.queryFeatures({
+    where:`TRAMO_ATT='${v}'`,
+    outFields:["*"],
+    returnGeometry:false
+  });
+  const totals={};
+  res.features.forEach(f=>{
+    Object.keys(f.attributes).forEach(field=>{
+      const regex=new RegExp(`^${type}_(river|coast|tsunami|earthquake)_(\\d+)`,'i');
+      if(!field.match(regex)) return;
+      totals[field]=(totals[field]||0)+Number(f.attributes[field]||0);
+    });
+  });
+  return extractSeries(totals,type);
+}
+
+/* Canvas scale for sharpness */
 function fitCanvas(canvas){
   const r=canvas.getBoundingClientRect();
   const dpr=window.devicePixelRatio||1;
@@ -180,10 +213,14 @@ function drawSmoothLine(ctx,pts){
     const yc=(pts[i].y+pts[i+1].y)/2;
     ctx.quadraticCurveTo(pts[i].x,pts[i].y,xc,yc);
   }
-  ctx.quadraticCurveTo(pts[pts.length-1].x,pts[pts.length-1].y,pts[pts.length-1].x,pts[pts.length-1].y);
+  ctx.quadraticCurveTo(
+    pts[pts.length-1].x,pts[pts.length-1].y,
+    pts[pts.length-1].x,pts[pts.length-1].y
+  );
   ctx.stroke();
 }
 
+/* ===== DRAW with full axes (X ticks like your original) ===== */
 function drawMulti(canvas,titleId,titleText,series,xLabel){
   document.getElementById(titleId).textContent=titleText;
   const {ctx,w,h}=fitCanvas(canvas);
@@ -192,20 +229,22 @@ function drawMulti(canvas,titleId,titleText,series,xLabel){
 
   const padL=80,padR=20,padT=20,padB=80;
 
+  // plot background
   ctx.fillStyle="#f2f2f2";
   ctx.fillRect(padL,padT,w-padL-padR,h-padT-padB);
 
-  const allX=series.flatMap(s=>s.x);
+  const allX=series.flatMap(s=>s.x).filter(v=>isFinite(v));
   const xmin=Math.min(...allX);
   const xmax=Math.max(...allX);
 
+  // Annual rate (1/m): 10^0 .. 10^-4
   const ymin=Math.log10(0.0001);
   const ymax=Math.log10(1);
 
   const xScale=x=>padL+(x-xmin)*(w-padL-padR)/(xmax-xmin||1);
   const yScale=y=>h-padB-(y-ymin)*(h-padB-padT)/(ymax-ymin);
 
-  // AXES
+  // Axes
   ctx.strokeStyle="#333";
   ctx.lineWidth=1;
   ctx.beginPath();
@@ -214,36 +253,35 @@ function drawMulti(canvas,titleId,titleText,series,xLabel){
   ctx.lineTo(w-padR,h-padB);
   ctx.stroke();
 
-  // ===== Y TICKS =====
-  const yTicks = [1, 0.1, 0.01, 0.001, 0.0001];
-  ctx.font = "11px Arial";
-  ctx.textAlign = "right";
-  ctx.fillStyle = "#000";
+  // Y ticks (log)
+  const yTicks=[1,0.1,0.01,0.001,0.0001];
+  ctx.font="11px Arial";
+  ctx.textAlign="right";
+  ctx.fillStyle="#000";
 
-  
-yTicks.forEach(val => {
-  const y = yScale(Math.log10(val));
+  yTicks.forEach(val=>{
+    const y=yScale(Math.log10(val));
 
-  // grid
-  ctx.strokeStyle = "rgba(0,0,0,0.08)";
-  ctx.beginPath();
-  ctx.moveTo(padL, y);
-  ctx.lineTo(w - padR, y);
-  ctx.stroke();
+    // gridline
+    ctx.strokeStyle="rgba(0,0,0,0.08)";
+    ctx.beginPath();
+    ctx.moveTo(padL,y);
+    ctx.lineTo(w-padR,y);
+    ctx.stroke();
 
-  // tick
-  ctx.strokeStyle = "#333";
-  ctx.beginPath();
-  ctx.moveTo(padL - 5, y);
-  ctx.lineTo(padL, y);
-  ctx.stroke();
+    // tick
+    ctx.strokeStyle="#333";
+    ctx.beginPath();
+    ctx.moveTo(padL-5,y);
+    ctx.lineTo(padL,y);
+    ctx.stroke();
 
-  // label formato 10^-x
-  const exponent = Math.log10(val);
-  ctx.fillText(`10^${exponent}`, padL - 8, y + 3);
-});
+    // label 10^exponent
+    const exponent=Math.log10(val); // 0, -1, -2, -3, -4
+    ctx.fillText(`10^${exponent}`,padL-8,y+3);
+  });
 
-  // ===== X TICKS =====
+  // X ticks like original
   const tickCount=6;
   ctx.textAlign="center";
   ctx.fillStyle="#000";
@@ -252,21 +290,31 @@ yTicks.forEach(val => {
     const val=xmin+(i*(xmax-xmin)/tickCount);
     const x=xScale(val);
 
+    // gridline
+    ctx.strokeStyle="rgba(0,0,0,0.08)";
+    ctx.beginPath();
+    ctx.moveTo(x,padT);
+    ctx.lineTo(x,h-padB);
+    ctx.stroke();
+
+    // tick
     ctx.strokeStyle="#333";
     ctx.beginPath();
     ctx.moveTo(x,h-padB);
     ctx.lineTo(x,h-padB+5);
     ctx.stroke();
 
+    // label
     ctx.fillText(formatNumber(val),x,h-padB+18);
   }
 
-  // ===== SERIES =====
+  // Series
   series.forEach(s=>{
     ctx.strokeStyle=s.color;
     ctx.lineWidth=2.8;
     const pts=s.x.map((x,i)=>({x:xScale(x),y:yScale(s.y[i])}));
     drawSmoothLine(ctx,pts);
+
     ctx.fillStyle=s.color;
     pts.forEach(p=>{
       ctx.beginPath();
@@ -275,7 +323,7 @@ yTicks.forEach(val => {
     });
   });
 
-  // ===== AXIS LABELS =====
+  // Axis labels
   ctx.fillStyle="#000";
   ctx.font="12px Arial";
   ctx.textAlign="center";
@@ -288,76 +336,219 @@ yTicks.forEach(val => {
   ctx.restore();
 }
 
-
+/* ===== Curves rendering helpers ===== */
 async function showTotalSystemCurves(){
   const lossSeries=await buildTotalSeries("loss");
   const damageSeries=await buildTotalSeries("damage");
+
   drawMulti(lossCanvas,"lossTitle","Loss Curves — TOTAL SYSTEM (DOP)",lossSeries,"Loss (DOP)");
   drawMulti(damageCanvas,"damageTitle","Damage Curves — TOTAL SYSTEM (DOP)",damageSeries,"Damage (DOP)");
   drawLegend("lossLegend",lossSeries);
   drawLegend("damageLegend",damageSeries);
-  selectorSub.textContent="Showing TOTAL system curves";
+
+  selectorSub.textContent="TOTAL SYSTEM";
 }
 
-function setHighlight(feature){
+function setHighlight(graphic){
+  if(!layerViewRef) return;
   if(highlightHandle){highlightHandle.remove();}
-  highlightHandle=layerViewRef.highlight(feature);
+  highlightHandle=layerViewRef.highlight(graphic);
 }
 
-function updateFromFeature(feature,total){
+/* ===== Update from a single feature (ID_TRAMO) ===== */
+function updateFromFeature(feature){
   const attrs=feature.attributes;
   const id=attrs.ID_TRAMO;
+
   const lossSeries=extractSeries(attrs,"loss");
   const damageSeries=extractSeries(attrs,"damage");
-  drawMulti(lossCanvas,"lossTitle",`Loss Curves — ${id}`,lossSeries,"Loss (DOP)");
-  drawMulti(damageCanvas,"damageTitle",`Damage Curves — ${id}`,damageSeries,"Damage (DOP)");
+
+  drawMulti(lossCanvas,"lossTitle",`Loss Curves — ${id} (DOP)`,lossSeries,"Loss (DOP)");
+  drawMulti(damageCanvas,"damageTitle",`Damage Curves — ${id} (DOP)`,damageSeries,"Damage (DOP)");
   drawLegend("lossLegend",lossSeries);
   drawLegend("damageLegend",damageSeries);
-  selectorSub.textContent=`Selected: ${id} • Total: ${total}`;
+
+  selectorSub.textContent=`ID_TRAMO: ${id}`;
 }
 
+/* ===== Update for TRAMO_ATT group ===== */
+async function updateFromTramoAtt(tramoAttValue){
+  const lossSeries=await buildSeriesByTramoAtt(tramoAttValue,"loss");
+  const damageSeries=await buildSeriesByTramoAtt(tramoAttValue,"damage");
+
+  drawMulti(lossCanvas,"lossTitle",`Loss Curves — TRAMO_ATT: ${tramoAttValue} (DOP)`,lossSeries,"Loss (DOP)");
+  drawMulti(damageCanvas,"damageTitle",`Damage Curves — TRAMO_ATT: ${tramoAttValue} (DOP)`,damageSeries,"Damage (DOP)");
+  drawLegend("lossLegend",lossSeries);
+  drawLegend("damageLegend",damageSeries);
+
+  selectorSub.textContent=`TRAMO_ATT: ${tramoAttValue}`;
+}
+
+/* ===== Zoom helpers ===== */
+async function zoomToIdTramo(id){
+  const res=await layer.queryFeatures({
+    where:`ID_TRAMO=${id}`,
+    outFields:["*"],
+    returnGeometry:true
+  });
+  const f=res.features && res.features[0];
+  if(!f) return;
+  await view.goTo(f.geometry);
+  setHighlight(f);
+  updateFromFeature(f);
+}
+
+async function zoomToTramoAtt(tramoAttValue){
+  const v=escapeSqlString(tramoAttValue);
+
+  // zoom to group extent (fast)
+  const ext=await layer.queryExtent({ where:`TRAMO_ATT='${v}'` });
+  if(ext && ext.extent){
+    await view.goTo(ext.extent.expand(1.3));
+  }
+
+  // highlight group (optional: highlight all features in group)
+  // we'll highlight by applying a highlight to the layerView selection via queryFeatures small sample
+  const sample=await layer.queryFeatures({
+    where:`TRAMO_ATT='${v}'`,
+    outFields:["ID_TRAMO","TRAMO_ATT"],
+    returnGeometry:true,
+    num: 1
+  });
+  if(sample.features && sample.features[0]){
+    setHighlight(sample.features[0]);
+  }
+
+  await updateFromTramoAtt(tramoAttValue);
+}
+
+/* ===== Init ===== */
 view.when(async()=>{
   initialExtent=view.extent.clone();
   layerViewRef=await view.whenLayerView(layer);
 
-  const res=await layer.queryFeatures({where:"1=1",outFields:["ID_TRAMO"],returnDistinctValues:true});
-  const ids=res.features.map(f=>f.attributes.ID_TRAMO).sort((a,b)=>a-b);
-  ids.forEach(id=>{
-    const opt=document.createElement("option");
-    opt.value=id; opt.text=id;
-    select.appendChild(opt);
+  // Populate ID_TRAMO
+  const idsRes=await layer.queryFeatures({
+    where:"1=1",
+    outFields:["ID_TRAMO"],
+    returnDistinctValues:true,
+    returnGeometry:false
   });
 
-  select.dataset.totalCount=ids.length;
+  // clean current options except placeholder
+  tramoSelect.innerHTML='<option value="">Filter by ID_TRAMO</option>';
+
+  const ids=idsRes.features
+    .map(f=>f.attributes.ID_TRAMO)
+    .filter(v=>v!==null && v!==undefined && v!=="")
+    .sort((a,b)=>Number(a)-Number(b));
+
+  ids.forEach(id=>{
+    const opt=document.createElement("option");
+    opt.value=id;
+    opt.text=id;
+    tramoSelect.appendChild(opt);
+  });
+
+  // Populate TRAMO_ATT
+  const attRes=await layer.queryFeatures({
+    where:"1=1",
+    outFields:["TRAMO_ATT"],
+    returnDistinctValues:true,
+    returnGeometry:false
+  });
+
+  tramoAttSelect.innerHTML='<option value="">Filter by TRAMO_ATT</option>';
+
+  const attValues=attRes.features
+    .map(f=>f.attributes.TRAMO_ATT)
+    .filter(v=>v!==null && v!==undefined && String(v).trim()!=="")
+    .map(v=>String(v))
+    .sort((a,b)=>a.localeCompare(b));
+
+  attValues.forEach(v=>{
+    const opt=document.createElement("option");
+    opt.value=v;
+    opt.text=v;
+    tramoAttSelect.appendChild(opt);
+  });
+
   await showTotalSystemCurves();
 });
 
+/* ===== Map click behavior (zoom + curves by ID_TRAMO) ===== */
 view.on("click",async e=>{
   const hit=await view.hitTest(e);
-  const r=hit.results.find(x=>x.graphic.layer===layer);
+  const r=hit.results.find(x=>x.graphic && x.graphic.layer===layer);
   if(!r) return;
-  setHighlight(r.graphic);
-  updateFromFeature(r.graphic,select.dataset.totalCount);
+
+  const g=r.graphic;
+  const id=g.attributes && g.attributes.ID_TRAMO;
+
+  // clear TRAMO_ATT selection
+  tramoAttSelect.value="";
+
+  // set ID_TRAMO selection to clicked
+  if(id!==null && id!==undefined) tramoSelect.value=String(id);
+
+  await view.goTo(g.geometry);
+  setHighlight(g);
+  updateFromFeature(g);
 });
 
-select.addEventListener("change",async ()=>{
-  const id=select.value;
-  if(!id) return;
-  const res=await layer.queryFeatures({where:`ID_TRAMO=${id}`,outFields:["*"],returnGeometry:true});
-  const f=res.features[0];
-  await view.goTo(f.geometry);
-  setHighlight(f);
-  updateFromFeature(f,select.dataset.totalCount);
+/* ===== Select ID_TRAMO (zoom + highlight + curves) ===== */
+tramoSelect.addEventListener("change",async ()=>{
+  const id=tramoSelect.value;
+  if(!id){
+    // if cleared and no TRAMO_ATT selected -> total
+    if(!tramoAttSelect.value) await showTotalSystemCurves();
+    return;
+  }
+  // clear TRAMO_ATT
+  tramoAttSelect.value="";
+  await zoomToIdTramo(id);
 });
 
+/* ===== Select TRAMO_ATT (zoom extent + curves aggregated) ===== */
+tramoAttSelect.addEventListener("change",async ()=>{
+  const val=tramoAttSelect.value;
+  if(!val){
+    // if cleared and no ID selected -> total
+    if(!tramoSelect.value) await showTotalSystemCurves();
+    return;
+  }
+  // clear ID_TRAMO and any highlight (we'll highlight a sample)
+  tramoSelect.value="";
+  if(highlightHandle){highlightHandle.remove();}
+
+  await zoomToTramoAtt(val);
+});
+
+/* ===== Reset ===== */
 resetBtn.addEventListener("click",async ()=>{
   if(highlightHandle){highlightHandle.remove();}
+  tramoSelect.value="";
+  tramoAttSelect.value="";
   await view.goTo(initialExtent);
-  select.value="";
   await showTotalSystemCurves();
+});
+
+/* ===== Optional: keep charts responsive ===== */
+window.addEventListener("resize",()=>{
+  // redraw current state
+  const id=tramoSelect.value;
+  const att=tramoAttSelect.value;
+  if(att){
+    updateFromTramoAtt(att);
+  } else if(id){
+    zoomToIdTramo(id);
+  } else {
+    showTotalSystemCurves();
+  }
 });
 
 });
 </script>
 </body>
 </html>
+
